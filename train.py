@@ -1,14 +1,33 @@
 """
 =============================================================
-  CAAP IoMT IDS — TRAINING SCRIPT v4
+  CAAP IoMT IDS — TRAINING SCRIPT v5
   3-Model Pipeline: Random Forest + Isolation Forest + K-Means
-  + CAS Scoring Engine Integration
 
-  ► DROP YOUR FILES HERE BEFORE RUNNING:
-      data/train/iomt_train.csv
-      data/test/iomt_test.csv
+  ► HOW TO USE:
+      Drop ALL individual pcap CSV files into:
+          data/train/   (e.g. ARP_Spoofing_train.pcap.csv)
+          data/test/    (e.g. ARP_Spoofing_test.pcap.csv)
 
-  Real CIC IoMT 2024 column schema (45 network features):
+      Labels are derived automatically from filenames.
+      No single merged CSV required — this script merges them.
+
+  ► Label mapping (filename prefix → label group):
+      ARP_Spoofing*         → ARP_Spoofing
+      Benign*               → Benign
+      MQTT-DDoS-*           → MQTT_Publish_Flood
+      MQTT-DoS-*            → MQTT_Publish_Flood
+      MQTT-Malformed*       → MQTT_Brute_Force
+      Recon-*               → Recon
+      TCP_IP-DDoS-SYN*      → DoS_TCP
+      TCP_IP-DoS-SYN*       → DoS_TCP
+      TCP_IP-DDoS-TCP*      → DoS_TCP
+      TCP_IP-DoS-TCP*       → DoS_TCP
+      TCP_IP-DDoS-ICMP*     → DoS_TCP
+      TCP_IP-DoS-ICMP*      → DoS_TCP
+      TCP_IP-DDoS-UDP*      → DoS_TCP
+      TCP_IP-DoS-UDP*       → DoS_TCP
+
+  Real CIC IoMT 2024 network feature columns (used as ML input):
     Header_Length, Protocol Type, Duration, Rate, Srate, Drate,
     fin_flag_number, syn_flag_number, rst_flag_number, psh_flag_number,
     ack_flag_number, ece_flag_number, cwr_flag_number,
@@ -18,17 +37,13 @@
     Tot sum, Min, Max, AVG, Std, Tot size,
     IAT, Number, Magnitue, Radius, Covariance, Variance, Weight
 
-  Medical metadata columns (used for CAS only, NOT ML input):
-    device_type, cc_score, department,
-    patient_dependency, time_sensitivity, shift
-
   Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security
   Usage  : python train.py
   Output : models/*.pkl   reports/*.png   reports/classification_report.txt
 =============================================================
 """
 
-import os, sys, warnings, time
+import os, re, warnings, time, glob
 import joblib
 import numpy as np
 import pandas as pd
@@ -46,101 +61,132 @@ from sklearn.metrics import (
 )
 from sklearn.utils.class_weight import compute_sample_weight
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "src"))
-from cas_engine import score_alert
-
 warnings.filterwarnings("ignore")
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TRAIN_CSV  = "data/train/iomt_train.csv"
-TEST_CSV   = "data/test/iomt_test.csv"
+TRAIN_DIR  = "data/train"
+TEST_DIR   = "data/test"
 MODEL_DIR  = "models"
 REPORT_DIR = "reports"
-N_CLUSTERS = 3
+N_CLUSTERS = 2
 
-# Medical metadata — used for CAS scoring, excluded from ML feature matrix
-MEDICAL_COLS = [
-    "device_type", "cc_score", "department",
-    "patient_dependency", "time_sensitivity", "shift",
+CLUSTER_LABELS = {0: "active", 1: "idle"}
+
+# ── LABEL MAP: filename prefix → canonical label ──────────────────────────────
+LABEL_MAP = [
+    (r"^arp_spoofing",               "ARP_Spoofing"),
+    (r"^benign",                     "Benign"),
+    (r"^mqtt.*flood",                "MQTT_Publish_Flood"),
+    (r"^mqtt.*malformed",            "MQTT_Brute_Force"),
+    (r"^mqtt",                       "MQTT_Publish_Flood"),
+    (r"^recon",                      "Recon"),
+    (r"^tcp_ip.*(dos|ddos).*(syn|tcp|icmp|udp)", "DoS_TCP"),
 ]
 
-CLUSTER_LABELS = {0: "active", 1: "routine", 2: "idle"}
+def filename_to_label(fname: str) -> str:
+    """Derive label from a pcap CSV filename."""
+    stem = os.path.splitext(os.path.basename(fname))[0].lower()
+    stem = re.sub(r"[_\-](train|test)(\.pcap)?$", "", stem)
+    stem = re.sub(r"\.pcap$", "", stem)
+    for pattern, label in LABEL_MAP:
+        if re.search(pattern, stem, re.IGNORECASE):
+            return label
+    return stem.replace("-", "_").replace(" ", "_").title()
 
+
+# ── HELPERS ───────────────────────────────────────────────────────────────────
 os.makedirs(MODEL_DIR,  exist_ok=True)
 os.makedirs(REPORT_DIR, exist_ok=True)
-
 t_start = time.time()
 
 
-# ── STEP 1 : LOAD DATA ────────────────────────────────────────────────────────
-print("\n" + "=" * 62)
-print("  STEP 1 — LOADING DATA")
-print("=" * 62)
-
-# Support both CSV and Excel (in case files were saved as .xlsx)
-def smart_read(path):
-    if not os.path.exists(path):
+def load_and_merge(directory: str) -> pd.DataFrame:
+    """
+    Reads every *.csv in `directory`, derives the label from the filename,
+    appends a 'label' column, concatenates everything, drops NaNs,
+    and returns the combined DataFrame.
+    """
+    csv_files = sorted(glob.glob(os.path.join(directory, "*.csv")))
+    if not csv_files:
         raise FileNotFoundError(
-            f"\n  ✗ File not found: {path}\n"
-            f"  → Place your dataset at: {os.path.abspath(path)}\n"
+            f"\n  ✗ No CSV files found in: {os.path.abspath(directory)}\n"
+            f"  → Place your pcap CSV files there and re-run.\n"
         )
-    try:
-        return pd.read_csv(path)
-    except UnicodeDecodeError:
+
+    frames = []
+    for f in csv_files:
         try:
-            return pd.read_excel(path, engine="openpyxl")
-        except Exception:
-            return pd.read_csv(path, encoding="latin1")
+            df = pd.read_csv(f, low_memory=False)
+        except UnicodeDecodeError:
+            df = pd.read_csv(f, encoding="latin1", low_memory=False)
 
-train_df = smart_read(TRAIN_CSV).dropna()
-test_df  = smart_read(TEST_CSV).dropna()
+        lbl = filename_to_label(f)
+        df["label"] = lbl
+        frames.append(df)
+        print(f"    {os.path.basename(f):<55}  {len(df):>8,} rows  →  {lbl}")
 
-print(f"  ✓ Train : {len(train_df):>8,} rows  |  {train_df.shape[1]} columns")
-print(f"  ✓ Test  : {len(test_df):>8,} rows  |  {test_df.shape[1]} columns")
-print(f"  Train labels : {sorted(train_df['label'].unique())}")
+    combined = pd.concat(frames, ignore_index=True)
+    combined.columns = combined.columns.str.strip()
+    combined.dropna(how="all", inplace=True)
+
+    return combined.reset_index(drop=True)
+
+
+# ── STEP 1 : LOAD DATA ────────────────────────────────────────────────────────
+print("\n" + "=" * 68)
+print("  STEP 1 — LOADING & MERGING CSV FILES")
+print("=" * 68)
+
+print(f"\n  [TRAIN — {TRAIN_DIR}]")
+train_df = load_and_merge(TRAIN_DIR)
+
+print(f"\n  [TEST  — {TEST_DIR}]")
+test_df  = load_and_merge(TEST_DIR)
+
+print(f"\n  ✓ Train combined : {len(train_df):>8,} rows  |  {train_df.shape[1]} columns")
+print(f"  ✓ Test  combined : {len(test_df):>8,} rows  |  {test_df.shape[1]} columns")
+print(f"\n  Train labels : {sorted(train_df['label'].unique())}")
 print(f"  Test  labels : {sorted(test_df['label'].unique())}")
 
-# Check for label mismatch
+# Drop test labels not seen during training
 missing_in_train = set(test_df["label"].unique()) - set(train_df["label"].unique())
 if missing_in_train:
     print(f"\n  ⚠  Labels in test but not train: {missing_in_train}")
-    print(f"  → These rows will be dropped from test.")
-    test_df = test_df[test_df["label"].isin(train_df["label"].unique())]
+    test_df = test_df[test_df["label"].isin(train_df["label"].unique())].reset_index(drop=True)
+    print(f"  → Dropped. Test now {len(test_df):,} rows.")
 else:
     print(f"  ✓ All test labels present in training data.")
 
 
 # ── STEP 2 : PREPROCESSING ────────────────────────────────────────────────────
-print("\n" + "=" * 62)
+print("\n" + "=" * 68)
 print("  STEP 2 — PREPROCESSING")
-print("=" * 62)
+print("=" * 68)
 
-# Save medical metadata for CAS (separate from ML training)
-train_meta = train_df[[c for c in MEDICAL_COLS if c in train_df.columns]].copy()
-test_meta  = test_df[[c  for c in MEDICAL_COLS if c in test_df.columns]].copy()
+exclude    = {"label"}
+FEATURE_COLS, dropped = [], []
 
-# Build feature column list: all numeric columns except label & medical metadata
-exclude = {"label"} | set(MEDICAL_COLS)
-FEATURE_COLS = []
-dropped = []
 for col in train_df.columns:
     if col in exclude:
         continue
     try:
-        train_df[col] = pd.to_numeric(train_df[col])
-        test_df[col]  = pd.to_numeric(test_df[col])
+        train_df[col] = pd.to_numeric(train_df[col], errors="raise")
+        test_df[col]  = pd.to_numeric(test_df[col],  errors="raise")
         FEATURE_COLS.append(col)
     except Exception:
         dropped.append(col)
 
 if dropped:
-    print(f"  ⚠  Dropped non-numeric columns: {dropped}")
+    print(f"  ⚠  Dropped non-numeric / text columns ({len(dropped)}): {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+train_df = train_df[FEATURE_COLS + ["label"]].dropna().reset_index(drop=True)
+test_df  = test_df[FEATURE_COLS  + ["label"]].dropna().reset_index(drop=True)
 
 print(f"  Network feature columns : {len(FEATURE_COLS)}")
-print(f"  Medical metadata cols   : {list(train_meta.columns)}")
 print(f"  Feature list: {FEATURE_COLS}")
+print(f"\n  After NaN drop — Train: {len(train_df):,}   Test: {len(test_df):,}")
 
-# Labels
+# Label encoding
 y_train_raw = train_df["label"].values
 y_test_raw  = test_df["label"].values
 
@@ -151,58 +197,54 @@ y_test  = le.transform(y_test_raw)
 print(f"\n  Classes ({len(le.classes_)}): {list(le.classes_)}")
 
 # Feature matrices
-X_train_raw = train_df[FEATURE_COLS].values
-X_test_raw  = test_df[FEATURE_COLS].values
+X_train_raw = train_df[FEATURE_COLS].values.astype(np.float64)
+X_test_raw  = test_df[FEATURE_COLS].values.astype(np.float64)
 
-# StandardScaler — fit ONLY on training data
 scaler  = StandardScaler()
 X_train = scaler.fit_transform(X_train_raw)
 X_test  = scaler.transform(X_test_raw)
 print(f"  StandardScaler fitted on {len(X_train):,} training rows ✓")
 
-# Class-balanced sample weights for Random Forest
 sample_weights = compute_sample_weight("balanced", y_train)
 
 print(f"\n  Class distribution (train):")
-for cls, cnt in sorted(zip(*np.unique(y_train_raw, return_counts=True)),
-                        key=lambda x: -x[1]):
+for cls, cnt in sorted(zip(*np.unique(y_train_raw, return_counts=True)), key=lambda x: -x[1]):
     pct = cnt / len(y_train_raw) * 100
     bar = "█" * int(pct / 2)
-    print(f"    {cls:<25} {cnt:>8,}  ({pct:5.1f}%)  {bar}")
+    print(f"    {cls:<28} {cnt:>10,}  ({pct:5.1f}%)  {bar}")
 
 
 # ── STEP 3 : TRAIN MODELS ─────────────────────────────────────────────────────
 
 # ── 3a : Random Forest ────────────────────────────────────────────────────────
-print("\n" + "=" * 62)
-print("  STEP 3a — Random Forest  [TR dimension — main classifier]")
-print("=" * 62)
+print("\n" + "=" * 68)
+print("  STEP 3a — Random Forest  [main classifier]")
+print("=" * 68)
 
 rf = RandomForestClassifier(
-    n_estimators   = 300,      # 300 trees — strong ensemble
-    max_depth      = None,     # Grow fully — IoMT features support this
+    n_estimators     = 300,
+    max_depth        = None,
     min_samples_leaf = 1,
-    min_samples_split = 2,
-    max_features   = "sqrt",   # Standard for classification
-    class_weight   = "balanced",
-    bootstrap      = True,
-    oob_score      = True,     # Free validation estimate
-    random_state   = 42,
-    n_jobs         = -1,
-    verbose        = 1,
+    min_samples_split= 2,
+    max_features     = "sqrt",
+    class_weight     = "balanced",
+    bootstrap        = True,
+    oob_score        = True,
+    random_state     = 42,
+    n_jobs           = -1,
+    verbose          = 1,
 )
 rf.fit(X_train, y_train, sample_weight=sample_weights)
-print(f"\n  ✓ Random Forest trained")
-print(f"  OOB Score (free train estimate): {rf.oob_score_ * 100:.2f}%")
+print(f"\n  ✓ Random Forest trained | OOB Score: {rf.oob_score_ * 100:.2f}%")
 
 # ── 3b : Isolation Forest ─────────────────────────────────────────────────────
-print("\n" + "=" * 62)
-print("  STEP 3b — Isolation Forest  [TS dimension — anomaly detector]")
-print("=" * 62)
+print("\n" + "=" * 68)
+print("  STEP 3b — Isolation Forest  [anomaly detector]")
+print("=" * 68)
 
 iso = IsolationForest(
     n_estimators  = 200,
-    contamination = 0.10,   # ~10% of traffic expected anomalous
+    contamination = 0.10,
     max_samples   = "auto",
     max_features  = 1.0,
     random_state  = 42,
@@ -213,26 +255,26 @@ iso.fit(X_train)
 print(f"  ✓ Isolation Forest trained")
 
 # ── 3c : K-Means ─────────────────────────────────────────────────────────────
-print("\n" + "=" * 62)
+print("\n" + "=" * 68)
 print(f"  STEP 3c — K-Means k={N_CLUSTERS}  [traffic behaviour clustering]")
-print("=" * 62)
+print("=" * 68)
 
 km = KMeans(
-    n_clusters = N_CLUSTERS,
-    init       = "k-means++",
-    n_init     = 20,
-    max_iter   = 500,
+    n_clusters   = N_CLUSTERS,
+    init         = "k-means++",
+    n_init       = 20,
+    max_iter     = 500,
     random_state = 42,
-    verbose    = 1,
+    verbose      = 1,
 )
 km.fit(X_train)
 print(f"  ✓ K-Means trained")
 
 
 # ── STEP 4 : SAVE ARTIFACTS ───────────────────────────────────────────────────
-print("\n" + "=" * 62)
+print("\n" + "=" * 68)
 print("  STEP 4 — SAVING ARTIFACTS  →  models/")
-print("=" * 62)
+print("=" * 68)
 
 joblib.dump(rf,           os.path.join(MODEL_DIR, "random_forest.pkl"))
 joblib.dump(iso,          os.path.join(MODEL_DIR, "isolation_forest.pkl"))
@@ -244,13 +286,13 @@ joblib.dump(FEATURE_COLS, os.path.join(MODEL_DIR, "feature_cols.pkl"))
 for fname in ["random_forest.pkl", "isolation_forest.pkl", "kmeans.pkl",
               "scaler.pkl", "label_encoder.pkl", "feature_cols.pkl"]:
     size = os.path.getsize(os.path.join(MODEL_DIR, fname)) / 1024
-    print(f"  ✓ {fname:<30}  ({size:>7.1f} KB)")
+    print(f"  ✓ {fname:<32}  ({size:>8.1f} KB)")
 
 
 # ── STEP 5 : EVALUATE ─────────────────────────────────────────────────────────
-print("\n" + "=" * 62)
+print("\n" + "=" * 68)
 print("  STEP 5 — EVALUATING ON TEST SET")
-print("=" * 62)
+print("=" * 68)
 
 y_pred_rf  = rf.predict(X_test)
 y_proba_rf = rf.predict_proba(X_test)
@@ -281,28 +323,27 @@ except Exception:
 
 print(f"\n{classification_report(y_test, y_pred_rf, target_names=le.classes_)}")
 
-# Save classification report
 with open(os.path.join(REPORT_DIR, "classification_report.txt"), "w") as f:
     f.write("CAAP IoMT IDS — Random Forest Classification Report\n")
-    f.write(f"Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security\n")
+    f.write("Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security\n")
     f.write(f"Overall Test Accuracy : {acc * 100:.2f}%\n")
     if auc:
         f.write(f"AUC-ROC (macro OvR)   : {auc:.4f}\n")
     f.write("\n")
     f.write(classification_report(y_test, y_pred_rf, target_names=le.classes_))
 
-print(f"  K-Means traffic clusters:")
+print(f"\n  K-Means traffic clusters:")
 u, c = np.unique(y_pred_km, return_counts=True)
 for ui, ci in zip(u, c):
     print(f"    {CLUSTER_LABELS.get(ui, '?'):8s}: {ci:,}")
 
 
 # ── STEP 6 : PER-CLASS ACCURACY ───────────────────────────────────────────────
-print("\n" + "=" * 62)
+print("\n" + "=" * 68)
 print("  STEP 6 — PER ATTACK TYPE ACCURACY")
-print("=" * 62)
-print(f"  {'Attack Type':<28} {'Samples':>8}  {'Accuracy':>9}  {'Status'}")
-print("  " + "─" * 62)
+print("=" * 68)
+print(f"  {'Attack Type':<32} {'Samples':>8}  {'Accuracy':>9}  {'Status'}")
+print("  " + "─" * 65)
 
 class_accs = {}
 for attack in le.classes_:
@@ -313,34 +354,13 @@ for attack in le.classes_:
     class_accs[attack] = ai * 100
     bar    = "█" * int(ai * 20)
     status = "✅" if ai >= 0.90 else "⚠️ " if ai >= 0.75 else "❌"
-    print(f"  {status} {attack:<26} {mask.sum():>8,}  {ai * 100:>8.2f}%  {bar}")
+    print(f"  {status} {attack:<30} {mask.sum():>8,}  {ai * 100:>8.2f}%  {bar}")
 
 
-# ── STEP 7 : CAS SCORING DEMO ─────────────────────────────────────────────────
-print("\n" + "=" * 62)
-print("  STEP 7 — CAS SCORING (first 10 test predictions)")
-print("=" * 62)
-print(f"\n  {'True':<22} {'Predicted':<22} {'Conf':>6}  {'Device':<20}  {'CAS':>6}  Action")
-print("  " + "─" * 92)
-
-for i in range(min(10, len(X_test))):
-    pred_lbl = le.inverse_transform([y_pred_rf[i]])[0]
-    true_lbl = y_test_raw[i]
-    cc_raw   = test_meta["cc_score"].iloc[i]   if "cc_score"         in test_meta.columns else 5
-    shift    = test_meta["shift"].iloc[i]       if "shift"            in test_meta.columns else "day"
-    ts_val   = test_meta["time_sensitivity"].iloc[i] if "time_sensitivity" in test_meta.columns else 3
-    dev      = test_meta["device_type"].iloc[i] if "device_type"      in test_meta.columns else "Unknown"
-    cas_r = score_alert(pred_lbl, float(confidence[i]), float(iso_scores[i]),
-                        bool(y_pred_iso[i] == -1), cc_raw, str(shift), ts_val)
-    match = "✓" if pred_lbl == true_lbl else "✗"
-    print(f"  {match} {true_lbl:<21} {pred_lbl:<22} {confidence[i]:>5.3f}"
-          f"  {str(dev):<20}  {cas_r['CAS']:>6.2f}  {cas_r['action']}")
-
-
-# ── STEP 8 : SAVE FULL PREDICTIONS WITH CAS ───────────────────────────────────
-print("\n" + "=" * 62)
-print("  STEP 8 — SAVING PREDICTIONS CSV")
-print("=" * 62)
+# ── STEP 7 : SAVE FULL PREDICTIONS ────────────────────────────────────────────
+print("\n" + "=" * 68)
+print("  STEP 7 — SAVING PREDICTIONS CSV")
+print("=" * 68)
 
 out = test_df[["label"]].copy().reset_index(drop=True)
 out["predicted"]  = le.inverse_transform(y_pred_rf)
@@ -350,69 +370,48 @@ out["is_anomaly"] = y_pred_iso == -1
 out["cluster"]    = [CLUSTER_LABELS.get(ci, str(ci)) for ci in y_pred_km]
 out["correct"]    = out["label"] == out["predicted"]
 
-# Add medical metadata columns if present
-for col in ["device_type", "cc_score", "shift", "department",
-            "patient_dependency", "time_sensitivity"]:
-    if col in test_meta.columns:
-        out[col] = test_meta[col].values
-
-# Compute CAS for every test row
-cas_col, action_col = [], []
-for i in range(len(out)):
-    cc_raw = test_meta["cc_score"].iloc[i]         if "cc_score"         in test_meta.columns else 5
-    shift  = test_meta["shift"].iloc[i]             if "shift"            in test_meta.columns else "day"
-    ts_val = test_meta["time_sensitivity"].iloc[i]  if "time_sensitivity" in test_meta.columns else 3
-    r = score_alert(out["predicted"].iloc[i], float(confidence[i]),
-                    float(iso_scores[i]), bool(y_pred_iso[i] == -1),
-                    cc_raw, str(shift), ts_val)
-    cas_col.append(r["CAS"])
-    action_col.append(r["action"])
-
-out["CAS"]    = cas_col
-out["action"] = action_col
 out.to_csv(os.path.join(REPORT_DIR, "predictions.csv"), index=False)
 print(f"  ✓ {len(out):,} rows saved → reports/predictions.csv")
 
 
-# ── STEP 9 : CHARTS ───────────────────────────────────────────────────────────
-print("\n" + "=" * 62)
-print("  STEP 9 — GENERATING CHARTS  →  reports/")
-print("=" * 62)
+# ── STEP 8 : CHARTS ───────────────────────────────────────────────────────────
+print("\n" + "=" * 68)
+print("  STEP 8 — GENERATING CHARTS  →  reports/")
+print("=" * 68)
 
 plt.style.use("seaborn-v0_8-whitegrid")
 
-# 9a — Confusion Matrix
+# 8a — Confusion Matrix
 fig, ax = plt.subplots(figsize=(12, 9))
 cm = confusion_matrix(y_test, y_pred_rf)
 sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
             xticklabels=le.classes_, yticklabels=le.classes_,
             ax=ax, linewidths=0.4, cbar_kws={"shrink": 0.8})
-ax.set_title(f"Confusion Matrix — RF Accuracy: {acc * 100:.2f}%",
-             fontsize=14, pad=12)
+ax.set_title(f"Confusion Matrix — RF Accuracy: {acc * 100:.2f}%", fontsize=14, pad=12)
 ax.set_ylabel("Actual Label"); ax.set_xlabel("Predicted Label")
 plt.xticks(rotation=40, ha="right"); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "confusion_matrix.png"), dpi=150)
 plt.close(); print("  ✓ confusion_matrix.png")
 
-# 9b — Per-Class Accuracy
+# 8b — Per-Class Accuracy
 colors = ["#2ecc71" if v >= 90 else "#e67e22" if v >= 75 else "#e74c3c"
           for v in class_accs.values()]
-fig, ax = plt.subplots(figsize=(13, 5))
+fig, ax = plt.subplots(figsize=(14, 5))
 bars = ax.bar(class_accs.keys(), class_accs.values(),
               color=colors, edgecolor="white", linewidth=0.8)
 ax.axhline(90, color="#27ae60", linestyle="--", alpha=0.7, label="90% target")
 ax.axhline(75, color="#e67e22", linestyle="--", alpha=0.5, label="75% baseline")
 for bar, val in zip(bars, class_accs.values()):
     ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-            f"{val:.1f}%", ha="center", fontsize=10, fontweight="bold")
+            f"{val:.1f}%", ha="center", fontsize=9, fontweight="bold")
 ax.set_title("Per-Class Accuracy on Test Set", fontsize=14)
 ax.set_ylabel("Accuracy (%)"); ax.set_ylim(0, 115)
 plt.xticks(rotation=35, ha="right"); plt.legend(); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "per_class_accuracy.png"), dpi=150)
 plt.close(); print("  ✓ per_class_accuracy.png")
 
-# 9c — Training Class Distribution
-fig, ax = plt.subplots(figsize=(13, 4))
+# 8c — Training Class Distribution
+fig, ax = plt.subplots(figsize=(14, 4))
 counts = pd.Series(y_train_raw).value_counts()
 bars2 = ax.bar(counts.index, counts.values, color="steelblue", edgecolor="white")
 ax.set_title("Training Set — Samples per Class", fontsize=14)
@@ -424,19 +423,18 @@ plt.xticks(rotation=35, ha="right"); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "class_distribution.png"), dpi=150)
 plt.close(); print("  ✓ class_distribution.png")
 
-# 9d — Feature Importances (Top 20)
+# 8d — Feature Importances (Top 20)
 importances = pd.Series(rf.feature_importances_, index=FEATURE_COLS)
 top20 = importances.nlargest(20).sort_values()
 fig, ax = plt.subplots(figsize=(11, 7))
-colors_fi = ["#e74c3c" if v >= top20.quantile(0.75) else "#3498db"
-             for v in top20.values]
+colors_fi = ["#e74c3c" if v >= top20.quantile(0.75) else "#3498db" for v in top20.values]
 top20.plot(kind="barh", ax=ax, color=colors_fi, edgecolor="white")
 ax.set_title("Top 20 Feature Importances — Random Forest", fontsize=13)
 ax.set_xlabel("Importance Score"); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "feature_importances.png"), dpi=150)
 plt.close(); print("  ✓ feature_importances.png")
 
-# 9e — Isolation Forest Score Distribution
+# 8e — Isolation Forest Score Distribution
 fig, ax = plt.subplots(figsize=(11, 4))
 is_attack = y_test_raw != "Benign"
 ax.hist(iso_scores[~is_attack], bins=80, alpha=0.65, color="#3498db",
@@ -450,42 +448,25 @@ ax.set_ylabel("Density"); ax.legend(); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "if_anomaly_dist.png"), dpi=150)
 plt.close(); print("  ✓ if_anomaly_dist.png")
 
-# 9f — K-Means Cluster Sizes
+# 8f — K-Means Cluster Sizes
 fig, ax = plt.subplots(figsize=(6, 4))
 ax.bar([CLUSTER_LABELS.get(ui, str(ui)) for ui in u], c,
-       color=["#e74c3c", "#3498db", "#2ecc71"], edgecolor="white")
+       color=["#e74c3c", "#2ecc71"], edgecolor="white")
 ax.set_title("K-Means — Traffic Behaviour Groups", fontsize=13)
 ax.set_ylabel("Sample Count"); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "kmeans_clusters.png"), dpi=150)
 plt.close(); print("  ✓ kmeans_clusters.png")
 
-# 9g — CAS Distribution by Action Tier
-fig, ax = plt.subplots(figsize=(11, 4))
-tier_colors = {"Immediate": "#e74c3c", "Investigate": "#e67e22", "Monitor": "#2ecc71"}
-for tier, col in tier_colors.items():
-    vals = [cas for cas, act in zip(cas_col, action_col) if act == tier]
-    if vals:
-        ax.hist(vals, bins=40, alpha=0.7, color=col, label=f"{tier} ({len(vals):,})",
-                density=True)
-ax.axvline(8.0, color="red",    linestyle="--", alpha=0.6, label="CAS 8.0 threshold")
-ax.axvline(5.0, color="orange", linestyle="--", alpha=0.6, label="CAS 5.0 threshold")
-ax.set_title("CAS Score Distribution by Action Tier", fontsize=13)
-ax.set_xlabel("CAS Score (0–10)"); ax.set_ylabel("Density")
-ax.legend(fontsize=9); plt.tight_layout()
-plt.savefig(os.path.join(REPORT_DIR, "cas_distribution.png"), dpi=150)
-plt.close(); print("  ✓ cas_distribution.png")
-
-# 9h — Model Comparison Summary
+# 8g — Model Comparison Summary
 fig, ax = plt.subplots(figsize=(9, 5))
 summary = {
-    "RF Accuracy (%)":      acc * 100,
-    "RF OOB Score (%)":     rf.oob_score_ * 100,
-    "IF Anomaly Rate (%)":  n_anom / len(y_pred_iso) * 100,
-    "AUC-ROC (×100)":       (auc * 100) if auc else 0,
+    "RF Accuracy (%)":            acc * 100,
+    "RF OOB Score (%)":           rf.oob_score_ * 100,
+    "IF Anomaly Rate (%)":        n_anom / len(y_pred_iso) * 100,
+    "AUC-ROC (×100)":             (auc * 100) if auc else 0,
     "K-Means Silhouette\n(×100)": (sil * 100) if sil else 0,
 }
 bar_colors = ["#2ecc71", "#27ae60", "#e67e22", "#9b59b6", "#3498db"]
-y_pos = range(len(summary))
 hbars = ax.barh(list(summary.keys()), list(summary.values()),
                 color=bar_colors, edgecolor="white")
 for bar, val in zip(hbars, summary.values()):
@@ -500,14 +481,16 @@ plt.close(); print("  ✓ model_summary.png")
 
 # ── FINAL SUMMARY ─────────────────────────────────────────────────────────────
 elapsed = time.time() - t_start
-print("\n" + "=" * 62)
+print("\n" + "=" * 68)
 print(f"  ✅  ALL DONE!")
-print(f"  Overall Accuracy : {acc * 100:.2f}%")
+print(f"  Classes trained on  : {list(le.classes_)}")
+print(f"  Feature columns     : {len(FEATURE_COLS)}")
+print(f"  Overall Accuracy    : {acc * 100:.2f}%")
 if auc:
-    print(f"  AUC-ROC          : {auc:.4f}")
-print(f"  OOB Score        : {rf.oob_score_ * 100:.2f}%")
-print(f"  Training time    : {elapsed:.1f}s")
-print("=" * 62)
+    print(f"  AUC-ROC             : {auc:.4f}")
+print(f"  OOB Score           : {rf.oob_score_ * 100:.2f}%")
+print(f"  Training time       : {elapsed:.1f}s")
+print("=" * 68)
 print(f"  Models  → {MODEL_DIR}/")
 print(f"  Reports → {REPORT_DIR}/")
-print("=" * 62 + "\n")
+print("=" * 68 + "\n")
