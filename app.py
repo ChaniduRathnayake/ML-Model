@@ -1,6 +1,6 @@
 """
 =============================================================
-  CAAP IoMT IDS — Flask AI Server v4
+  CAAP IoMT IDS — Flask AI Server v5
   POST /predict  →  label, confidence, TR_score, cluster,
                     CAS, action, dimensions (TR/CC/TS/AE/TC)
   GET  /health   →  status, classes, feature list
@@ -9,6 +9,17 @@
   Input uses EXACT CIC IoMT 2024 network feature column names.
   Medical metadata (cc_score, shift, time_sensitivity) is
   passed alongside network features for CAS scoring.
+
+  ── v5 CHANGE ─────────────────────────────────────────────────────────────
+  Isolation Forest anomaly detection now uses a ROC-tuned decision threshold
+  (models/if_threshold.pkl, produced by train.py) instead of the model's
+  built-in predict() cutoff. The built-in cutoff is derived only from the
+  benign training distribution and the `contamination` guess, with no
+  knowledge of real attack traffic — the tuned threshold is calibrated
+  against labeled benign + attack data via ROC analysis, which meaningfully
+  improves attack detection rate. See train.py Step 3b-2 for how it's
+  computed.
+  ─────────────────────────────────────────────────────────────────────────
 
   Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security
   Run    : python app.py
@@ -46,12 +57,25 @@ scaler       = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
 le           = joblib.load(os.path.join(MODEL_DIR, "label_encoder.pkl"))
 FEATURE_COLS = joblib.load(os.path.join(MODEL_DIR, "feature_cols.pkl"))
 
+# ROC-tuned Isolation Forest decision threshold (see train.py Step 3b-2).
+# is_anomaly  <=>  iso.decision_function(x) < IF_THRESHOLD
+if_threshold_path = os.path.join(MODEL_DIR, "if_threshold.pkl")
+if os.path.exists(if_threshold_path):
+    IF_THRESHOLD = joblib.load(if_threshold_path)
+else:
+    # Fallback for older model artifacts that predate threshold tuning —
+    # re-run train.py to generate models/if_threshold.pkl for best results.
+    IF_THRESHOLD = 0.0
+    print("  ⚠  models/if_threshold.pkl not found — falling back to threshold=0.0")
+    print("     Re-run train.py to generate a properly ROC-tuned threshold.")
+
 CLUSTER_LABELS = {0: "active", 1: "routine", 2: "idle"}
 
 print(f"✓ Models loaded | {len(le.classes_)} classes | {len(FEATURE_COLS)} features")
-print(f"  Classes      : {list(le.classes_)}")
-print(f"  Feature cols : {FEATURE_COLS}")
-print(f"  Listening on : http://0.0.0.0:5001\n")
+print(f"  Classes           : {list(le.classes_)}")
+print(f"  Feature cols      : {FEATURE_COLS}")
+print(f"  IF threshold      : {IF_THRESHOLD:.4f}  (ROC-tuned, see train.py)")
+print(f"  Listening on      : http://0.0.0.0:5001\n")
 
 
 # ── POST /predict ──────────────────────────────────────────────────────────────
@@ -98,7 +122,7 @@ def predict():
     label      = le.inverse_transform([pred_idx])[0]
     confidence = round(float(proba.max()), 4)
     iso_score  = round(float(iso.decision_function(vec_scaled)[0]), 4)
-    is_anomaly = bool(iso.predict(vec_scaled)[0] == -1)
+    is_anomaly = bool(iso_score < IF_THRESHOLD)   # ← ROC-tuned threshold, not iso.predict()
     cluster    = CLUSTER_LABELS.get(int(km.predict(vec_scaled)[0]), "unknown")
 
     # ── CAS scoring ──
@@ -138,6 +162,7 @@ def health():
         "classes"     : list(le.classes_),
         "n_features"  : len(FEATURE_COLS),
         "feature_cols": FEATURE_COLS,
+        "if_threshold": IF_THRESHOLD,
         "cas_weights" : {
             "TR": 0.25, "CC": 0.30, "TS": 0.25, "AE": 0.10, "TC": 0.10
         },
@@ -181,7 +206,7 @@ def features():
             "confidence" : "float — RF predict_proba max (0–1)",
             "TR_score"   : "float — Isolation Forest decision score",
             "cluster"    : "string — active / routine / idle",
-            "is_anomaly" : "bool — IF anomaly flag",
+            "is_anomaly" : "bool — IF anomaly flag (ROC-tuned threshold)",
             "CAS"        : "float — Clinical Alert Score (0–10)",
             "action"     : "string — Immediate / Investigate / Monitor",
             "dimensions" : {

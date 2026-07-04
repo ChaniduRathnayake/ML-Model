@@ -1,29 +1,3 @@
-"""
-=============================================================
-  CAAP IoMT IDS — TESTING / INFERENCE SCRIPT v6
-  Loads saved models and evaluates on all test pcap CSVs.
-  Also simulates the Flask POST /predict response.
-
-  ► Requires models/ to be populated by train.py first.
-  ► Requires data/test/*.pcap.csv  (individual attack files)
-
-  Labels are derived from filenames — same mapping as train.py.
-  CAS scoring uses real Dst Port + Protocol from each packet row.
-
-  ── v6 CHANGE ─────────────────────────────────────────────────────────────
-  Isolation Forest (loaded from models/isolation_forest.pkl) was trained by
-  train.py v6 on Benign-only rows (one-class anomaly detection), not the
-  full mixed training set. This script now reports IF's benign-vs-attack
-  separation explicitly (False Positive Rate / Attack Detection Rate) so
-  that its behaviour as an independent normal-traffic baseline is visible,
-  in addition to the existing RF classification metrics.
-  ─────────────────────────────────────────────────────────────────────────
-
-  Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security
-  Usage  : python test.py
-=============================================================
-"""
-
 import os, sys, re, json, glob, warnings, datetime
 import joblib
 import numpy as np
@@ -45,20 +19,13 @@ PROTO_MAP = {6: "tcp", 17: "udp", 1: "icmp", 2: "igmp"}
 
 # ── LABEL MAP (mirrors train.py exactly) ─────────────────────────────────────
 LABEL_MAP = [
-    (r"benign",                      "Benign"),              # ← unanchored: catches
-                                                               #   protocol-prefixed names
-                                                               #   like "WiFI_and_MQTT-Benign-train..."
     (r"^arp_spoofing",               "ARP_Spoofing"),
-    (r"arp.*spoof",                  "ARP_Spoofing"),
+    (r"^benign",                     "Benign"),
     (r"^mqtt.*flood",                "MQTT_Publish_Flood"),
     (r"^mqtt.*malformed",            "MQTT_Brute_Force"),
-    (r"mqtt.*flood",                 "MQTT_Publish_Flood"),
-    (r"mqtt.*malformed",             "MQTT_Brute_Force"),
     (r"^mqtt",                       "MQTT_Publish_Flood"),
     (r"^recon",                      "Recon"),
-    (r"recon",                       "Recon"),
     (r"^tcp_ip.*(dos|ddos).*(syn|tcp|icmp|udp)", "DoS_TCP"),
-    (r"tcp.ip.*(dos|ddos).*(syn|tcp|icmp|udp)",  "DoS_TCP"),
 ]
 
 def filename_to_label(fname: str) -> str:
@@ -98,13 +65,10 @@ km           = joblib.load(os.path.join(MODEL_DIR, "kmeans.pkl"))
 scaler       = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
 le           = joblib.load(os.path.join(MODEL_DIR, "label_encoder.pkl"))
 FEATURE_COLS = joblib.load(os.path.join(MODEL_DIR, "feature_cols.pkl"))
-IF_THRESHOLD = joblib.load(os.path.join(MODEL_DIR, "if_threshold.pkl"))
 
 print(f"  ✓ All models loaded")
 print(f"  Classes ({len(le.classes_)}): {list(le.classes_)}")
 print(f"  Features ({len(FEATURE_COLS)}): {FEATURE_COLS}")
-print(f"  ℹ  Isolation Forest was trained on Benign-only rows (one-class setup)")
-print(f"  ℹ  IF decision threshold (ROC-tuned) : {IF_THRESHOLD:.4f}")
 
 
 # ── LOAD & MERGE TEST DATA ────────────────────────────────────────────────────
@@ -183,7 +147,7 @@ print("=" * 64)
 y_pred_rf  = rf.predict(X_test)
 y_proba_rf = rf.predict_proba(X_test)
 confidence = y_proba_rf.max(axis=1)
-y_pred_iso = np.where(iso.decision_function(X_test) < IF_THRESHOLD, -1, 1)
+y_pred_iso = iso.predict(X_test)
 iso_scores = iso.decision_function(X_test)
 y_pred_km  = km.predict(X_test)
 
@@ -200,37 +164,9 @@ for ui, ci in zip(u, c):
     print(f"  K-Means Cluster {ui} ({CLUSTER_LABELS.get(ui, '?'):8s}): {ci:,}")
 
 
-# ── ISOLATION FOREST — BENIGN vs ATTACK SEPARATION ─────────────────────────────
-print("\n" + "=" * 64)
-print("  ISOLATION FOREST — BENIGN vs ATTACK SEPARATION  (one-class, Benign-trained)")
-print("=" * 64)
-
-is_benign_test = (y_test_raw == "Benign")
-n_benign = is_benign_test.sum()
-n_attack = (~is_benign_test).sum()
-
-fp_rate     = (y_pred_iso[is_benign_test] == -1).mean() * 100 if n_benign else float("nan")
-detect_rate = (y_pred_iso[~is_benign_test] == -1).mean() * 100 if n_attack else float("nan")
-
-print(f"  Benign test rows          : {n_benign:,}")
-print(f"  Attack test rows          : {n_attack:,}")
-print(f"  False Positive Rate       : {fp_rate:.2f}%   (benign flagged as anomalous — lower is better)")
-print(f"  Attack Detection Rate     : {detect_rate:.2f}%   (attacks flagged as anomalous — higher is better)")
-
-print(f"\n  {'Attack Type':<32} {'Samples':>8}  {'Anomaly Rate':>12}")
-print("  " + "─" * 58)
-for attack in le.classes_:
-    mask = y_test_raw == attack
-    if not mask.any():
-        continue
-    anom_rate = (y_pred_iso[mask] == -1).mean() * 100
-    tag = "(expect low)" if attack == "Benign" else "(expect high)"
-    print(f"  {attack:<32} {mask.sum():>8,}  {anom_rate:>10.2f}%   {tag}")
-
-
 # ── PER-CLASS BREAKDOWN ────────────────────────────────────────────────────────
 print("\n" + "=" * 64)
-print("  PER ATTACK TYPE ACCURACY  (Random Forest)")
+print("  PER ATTACK TYPE ACCURACY")
 print("=" * 64)
 print(f"  {'Attack Type':<32} {'Samples':>8}  {'Accuracy':>9}")
 print("  " + "─" * 58)
@@ -308,7 +244,7 @@ def predict_single(raw_features: dict, dst_port: int = 0,
     label      = le.inverse_transform([pred_idx])[0]
     conf       = round(float(proba.max()), 4)
     iso_score  = round(float(iso.decision_function(vec_scaled)[0]), 4)
-    is_anomaly = bool(iso_score < IF_THRESHOLD)
+    is_anomaly = bool(iso.predict(vec_scaled)[0] == -1)
     cluster_id = int(km.predict(vec_scaled)[0])
 
     cas_r = score_alert(label, conf, iso_score, is_anomaly,
@@ -359,66 +295,6 @@ out.to_csv("reports/test_predictions.csv", index=False)
 print(f"\n  ✓ Saved {len(out):,} rows → reports/test_predictions.csv")
 print(f"    Columns: {list(out.columns)}")
 
-
-# ── SAVE MODEL ACCURACY SUMMARY (TEST-SIDE)  ──────────────────────────────────
-summary_path = "reports/test_model_accuracy.txt"
-with open(summary_path, "w") as f:
-    f.write("=" * 68 + "\n")
-    f.write("  CAAP IoMT IDS — TEST SET MODEL ACCURACY SUMMARY\n")
-    f.write("  Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security\n")
-    f.write("=" * 68 + "\n\n")
-
-    f.write(f"Test rows total : {len(X_test):,}\n\n")
-
-    f.write("-" * 68 + "\n")
-    f.write("1. RANDOM FOREST — Attack Classification (TR dimension)\n")
-    f.write("-" * 68 + "\n")
-    f.write(f"  Overall Test Accuracy : {acc * 100:.2f}%\n\n")
-    f.write("  Per-class Test Accuracy:\n")
-    for attack in le.classes_:
-        mask = y_test_raw == attack
-        if not mask.any():
-            continue
-        ai = accuracy_score(y_test[mask], y_pred_rf[mask])
-        f.write(f"    {attack:<30} {ai * 100:>6.2f}%   ({mask.sum():,} samples)\n")
-    f.write("\n" + classification_report(y_test, y_pred_rf, target_names=le.classes_) + "\n")
-
-    f.write("-" * 68 + "\n")
-    f.write("2. ISOLATION FOREST — Anomaly Detection (TS dimension, Benign-only trained)\n")
-    f.write("-" * 68 + "\n")
-    f.write(f"  Benign test rows          : {n_benign:,}\n")
-    f.write(f"  Attack test rows          : {n_attack:,}\n")
-    f.write(f"  False Positive Rate       : {fp_rate:.2f}%  (benign flagged anomalous)\n")
-    f.write(f"  Attack Detection Rate     : {detect_rate:.2f}%  (attacks flagged anomalous)\n\n")
-    f.write("  Per-class Test Anomaly Rate:\n")
-    for attack in le.classes_:
-        mask = y_test_raw == attack
-        if not mask.any():
-            continue
-        anom_rate = (y_pred_iso[mask] == -1).mean() * 100
-        f.write(f"    {attack:<30} {anom_rate:>6.2f}%   ({mask.sum():,} samples)\n")
-
-    f.write("\n" + "-" * 68 + "\n")
-    f.write("3. K-MEANS — Traffic Behaviour Clustering (context dimension)\n")
-    f.write("-" * 68 + "\n")
-    for ui, ci in zip(u, c):
-        f.write(f"    {CLUSTER_LABELS.get(ui, str(ui)):<10} {ci:>10,} rows\n")
-
-    f.write("\n" + "-" * 68 + "\n")
-    f.write("4. CAS ACTION SUMMARY (combined pipeline)\n")
-    f.write("-" * 68 + "\n")
-    for act in ["Immediate", "Investigate", "Monitor"]:
-        f.write(f"    {act:<12} {action_counts.get(act, 0):>10,}\n")
-
-    f.write("\n" + "=" * 68 + "\n")
-    f.write("  END OF SUMMARY\n")
-    f.write("=" * 68 + "\n")
-
-print(f"  ✓ Saved → {summary_path}")
-
 print("\n" + "=" * 64)
 print(f"  ✅ TESTING COMPLETE!   Accuracy: {acc * 100:.2f}%")
-print(f"  IF False Positive Rate  : {fp_rate:.2f}%")
-print(f"  IF Attack Detection Rate: {detect_rate:.2f}%")
-print(f"  Accuracy summary → {summary_path}")
 print("=" * 64 + "\n")

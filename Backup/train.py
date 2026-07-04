@@ -1,61 +1,4 @@
-"""
-=============================================================
-  CAAP IoMT IDS — TRAINING SCRIPT v6
-  3-Model Pipeline: Random Forest + Isolation Forest + K-Means
-
-  ► HOW TO USE:
-      Drop ALL individual pcap CSV files into:
-          data/train/   (e.g. ARP_Spoofing_train.pcap.csv)
-          data/test/    (e.g. ARP_Spoofing_test.pcap.csv)
-
-      Labels are derived automatically from filenames.
-      No single merged CSV required — this script merges them.
-
-  ► Label mapping (filename prefix → label group):
-      ARP_Spoofing*         → ARP_Spoofing
-      Benign*               → Benign
-      MQTT-DDoS-*           → MQTT_Publish_Flood
-      MQTT-DoS-*            → MQTT_Publish_Flood
-      MQTT-Malformed*       → MQTT_Brute_Force
-      Recon-*                → Recon
-      TCP_IP-DDoS-SYN*       → DoS_TCP
-      TCP_IP-DoS-SYN*        → DoS_TCP
-      TCP_IP-DDoS-TCP*       → DoS_TCP
-      TCP_IP-DoS-TCP*        → DoS_TCP
-      TCP_IP-DDoS-ICMP*      → DoS_TCP
-      TCP_IP-DoS-ICMP*       → DoS_TCP
-      TCP_IP-DDoS-UDP*       → DoS_TCP
-      TCP_IP-DoS-UDP*        → DoS_TCP
-
-  Real CIC IoMT 2024 network feature columns (used as ML input):
-    Header_Length, Protocol Type, Duration, Rate, Srate, Drate,
-    fin_flag_number, syn_flag_number, rst_flag_number, psh_flag_number,
-    ack_flag_number, ece_flag_number, cwr_flag_number,
-    ack_count, syn_count, fin_count, rst_count,
-    HTTP, HTTPS, DNS, Telnet, SMTP, SSH, IRC,
-    TCP, UDP, DHCP, ARP, ICMP, IGMP, IPv, LLC,
-    Tot sum, Min, Max, AVG, Std, Tot size,
-    IAT, Number, Magnitue, Radius, Covariance, Variance, Weight
-
-  ── v6 CHANGE ─────────────────────────────────────────────────────────────
-  Isolation Forest is now trained in a proper ONE-CLASS configuration:
-  it is fit ONLY on rows labelled "Benign" from the training split, instead
-  of the full mixed (benign + attack) training set. This is standard
-  practice for unsupervised anomaly detectors — IF should learn what
-  "normal" IoMT traffic looks like, then flag deviations from that
-  boundary at inference time (attacks included). Training it on a mixed
-  set (as in v5) lets it partially absorb attack traffic as "normal",
-  which weakens its usefulness as an independent anomaly signal.
-  Random Forest and K-Means are unaffected by this change.
-  ─────────────────────────────────────────────────────────────────────────
-
-  Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security
-  Usage  : python train.py
-  Output : models/*.pkl   reports/*.png   reports/classification_report.txt
-=============================================================
-"""
-
-import os, re, warnings, time, glob, datetime
+import os, re, warnings, time, glob
 import joblib
 import numpy as np
 import pandas as pd
@@ -67,11 +10,9 @@ import seaborn as sns
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     classification_report, confusion_matrix,
     accuracy_score, roc_auc_score, silhouette_score,
-    roc_curve, auc as auc_score,
 )
 from sklearn.utils.class_weight import compute_sample_weight
 
@@ -88,20 +29,13 @@ CLUSTER_LABELS = {0: "active", 1: "idle"}
 
 # ── LABEL MAP: filename prefix → canonical label ──────────────────────────────
 LABEL_MAP = [
-    (r"benign",                      "Benign"),              # ← unanchored: catches
-                                                               #   protocol-prefixed names
-                                                               #   like "WiFI_and_MQTT-Benign-train..."
     (r"^arp_spoofing",               "ARP_Spoofing"),
-    (r"arp.*spoof",                  "ARP_Spoofing"),
+    (r"^benign",                     "Benign"),
     (r"^mqtt.*flood",                "MQTT_Publish_Flood"),
     (r"^mqtt.*malformed",            "MQTT_Brute_Force"),
-    (r"mqtt.*flood",                 "MQTT_Publish_Flood"),
-    (r"mqtt.*malformed",             "MQTT_Brute_Force"),
     (r"^mqtt",                       "MQTT_Publish_Flood"),
     (r"^recon",                      "Recon"),
-    (r"recon",                       "Recon"),
     (r"^tcp_ip.*(dos|ddos).*(syn|tcp|icmp|udp)", "DoS_TCP"),
-    (r"tcp.ip.*(dos|ddos).*(syn|tcp|icmp|udp)",  "DoS_TCP"),
 ]
 
 def filename_to_label(fname: str) -> str:
@@ -169,17 +103,6 @@ print(f"  ✓ Test  combined : {len(test_df):>8,} rows  |  {test_df.shape[1]} co
 print(f"\n  Train labels : {sorted(train_df['label'].unique())}")
 print(f"  Test  labels : {sorted(test_df['label'].unique())}")
 
-# ── DIAGNOSTIC: label distribution (catch mismapped filenames early) ──────────
-print(f"\n  Train label distribution:")
-for lbl, cnt in train_df["label"].value_counts().items():
-    print(f"    {lbl:<40} {cnt:>10,} rows")
-if "Benign" not in set(train_df["label"].unique()):
-    print(f"\n  ⚠  WARNING: No 'Benign' label found after filename mapping.")
-    print(f"  ⚠  Your filenames may not contain the literal substring 'benign'.")
-    print(f"  ⚠  Check the list above — if your normal-traffic class appears under")
-    print(f"     a different name (e.g. 'Wifi_And_Mqtt_Idle'), either rename the")
-    print(f"     files or add a pattern to LABEL_MAP mapping it to 'Benign'.")
-
 # Drop test labels not seen during training
 missing_in_train = set(test_df["label"].unique()) - set(train_df["label"].unique())
 if missing_in_train:
@@ -245,30 +168,6 @@ for cls, cnt in sorted(zip(*np.unique(y_train_raw, return_counts=True)), key=lam
     bar = "█" * int(pct / 2)
     print(f"    {cls:<28} {cnt:>10,}  ({pct:5.1f}%)  {bar}")
 
-# ── BENIGN-ONLY SPLIT (for Isolation Forest) ──────────────────────────────────
-if "Benign" not in set(y_train_raw):
-    raise ValueError(
-        "\n  ✗ No 'Benign' rows found in the training set.\n"
-        "  → Isolation Forest requires benign-only data to train on.\n"
-        "  → Check your LABEL_MAP / filenames in data/train/.\n"
-    )
-
-benign_mask = (y_train_raw == "Benign")
-X_train_benign  = X_train[benign_mask]
-X_train_attacks = X_train[~benign_mask]
-
-# Hold out 20% of benign rows — NOT used to fit IF — so we can honestly
-# calibrate its decision threshold afterwards against data it has never seen,
-# combined with real attack rows (also never seen by IF during .fit()).
-X_iso_fit, X_iso_calib_benign = train_test_split(
-    X_train_benign, test_size=0.2, random_state=42
-)
-
-print(f"\n  Isolation Forest data split:")
-print(f"    Fit (Benign, seen by IF)          : {X_iso_fit.shape[0]:,} rows")
-print(f"    Calibration (Benign, held out)     : {X_iso_calib_benign.shape[0]:,} rows")
-print(f"    Calibration (Attack, from train)   : {X_train_attacks.shape[0]:,} rows")
-
 
 # ── STEP 3 : TRAIN MODELS ─────────────────────────────────────────────────────
 
@@ -293,80 +192,22 @@ rf = RandomForestClassifier(
 rf.fit(X_train, y_train, sample_weight=sample_weights)
 print(f"\n  ✓ Random Forest trained | OOB Score: {rf.oob_score_ * 100:.2f}%")
 
-# ── 3b : Isolation Forest  [ONE-CLASS — Benign-only training] ─────────────────
+# ── 3b : Isolation Forest ─────────────────────────────────────────────────────
 print("\n" + "=" * 68)
-print("  STEP 3b — Isolation Forest  [anomaly detector | Benign-only]")
+print("  STEP 3b — Isolation Forest  [anomaly detector]")
 print("=" * 68)
 
 iso = IsolationForest(
-    n_estimators  = 300,
-    contamination = "auto",   # ← don't rely on contamination's blind quantile
-                               #   heuristic; we tune the real decision threshold
-                               #   below using labeled data instead
+    n_estimators  = 200,
+    contamination = 0.10,
     max_samples   = "auto",
     max_features  = 1.0,
     random_state  = 42,
     n_jobs        = -1,
     verbose       = 1,
 )
-iso.fit(X_iso_fit)   # ← trained ONLY on the Benign fit-split, never sees attacks
-                      #   or the held-out benign calibration rows
-print(f"  ✓ Isolation Forest trained on Benign-only data")
-
-# ── THRESHOLD TUNING — pick the anomaly cutoff using labeled data ────────────
-# iso.decision_function(): higher score = more "normal", lower/negative = more
-# anomalous. iso.predict()'s built-in -1/+1 threshold is derived purely from
-# the training (benign) score distribution and the `contamination` guess — it
-# has never seen an actual attack, so there's no reason to expect it lands in
-# a good place. Instead, we build a calibration set of (never-seen-by-IF)
-# benign rows + real attack rows, score them, and pick the threshold on the
-# ROC curve that best separates the two — this is what actually improves
-# attack detection instead of guessing at contamination.
-print("\n" + "=" * 68)
-print("  STEP 3b-2 — Tuning Isolation Forest threshold (ROC on calibration set)")
-print("=" * 68)
-
-X_calib = np.vstack([X_iso_calib_benign, X_train_attacks])
-y_calib_is_attack = np.concatenate([
-    np.zeros(len(X_iso_calib_benign), dtype=int),   # benign = 0
-    np.ones(len(X_train_attacks), dtype=int),        # attack = 1
-])
-
-calib_scores   = iso.decision_function(X_calib)   # higher = more normal
-anomaly_scores = -calib_scores                     # higher = more anomalous
-
-fpr, tpr, roc_thresholds = roc_curve(y_calib_is_attack, anomaly_scores)
-
-# Youden's J statistic — the threshold that best balances TPR and FPR
-youden_idx = np.argmax(tpr - fpr)
-best_anomaly_threshold = roc_thresholds[youden_idx]
-IF_THRESHOLD = -best_anomaly_threshold   # back to iso_score scale:
-                                          # is_anomaly  <=>  iso_score < IF_THRESHOLD
-
-roc_auc_if = auc_score(fpr, tpr)
-print(f"  ROC-AUC (Benign vs Attack separability) : {roc_auc_if:.4f}")
-print(f"  Youden-optimal cutoff — FPR: {fpr[youden_idx]*100:.2f}%  "
-      f"TPR (detection): {tpr[youden_idx]*100:.2f}%")
-
-print(f"\n  {'Target FPR':>12}  {'Actual FPR':>11}  {'Detection Rate':>15}")
-print("  " + "-" * 44)
-for target in (0.01, 0.05, 0.10, 0.15, 0.20):
-    idx = np.searchsorted(fpr, target)
-    idx = min(idx, len(fpr) - 1)
-    print(f"  {target*100:>10.0f}%  {fpr[idx]*100:>10.2f}%  {tpr[idx]*100:>14.2f}%")
-
-print(f"\n  ✓ Using Youden-optimal threshold by default (IF_THRESHOLD = {IF_THRESHOLD:.4f})")
-print(f"    → If you want tighter FPR control, override IF_THRESHOLD below using")
-print(f"      the target-FPR table above (e.g. pick the row matching your")
-print(f"      acceptable false-positive tolerance for a hospital SOC).")
-
-# ── OPTIONAL MANUAL OVERRIDE ───────────────────────────────────────────────
-# Uncomment and set to fix a specific False Positive Rate instead of Youden's
-# balance point, e.g. to cap FPR at 5% for a hospital SOC:
-#
-# target_fpr = 0.05
-# idx = np.searchsorted(fpr, target_fpr)
-# IF_THRESHOLD = -roc_thresholds[min(idx, len(roc_thresholds) - 1)]
+iso.fit(X_train)
+print(f"  ✓ Isolation Forest trained")
 
 # ── 3c : K-Means ─────────────────────────────────────────────────────────────
 print("\n" + "=" * 68)
@@ -396,10 +237,9 @@ joblib.dump(km,           os.path.join(MODEL_DIR, "kmeans.pkl"))
 joblib.dump(scaler,       os.path.join(MODEL_DIR, "scaler.pkl"))
 joblib.dump(le,           os.path.join(MODEL_DIR, "label_encoder.pkl"))
 joblib.dump(FEATURE_COLS, os.path.join(MODEL_DIR, "feature_cols.pkl"))
-joblib.dump(IF_THRESHOLD, os.path.join(MODEL_DIR, "if_threshold.pkl"))
 
 for fname in ["random_forest.pkl", "isolation_forest.pkl", "kmeans.pkl",
-              "scaler.pkl", "label_encoder.pkl", "feature_cols.pkl", "if_threshold.pkl"]:
+              "scaler.pkl", "label_encoder.pkl", "feature_cols.pkl"]:
     size = os.path.getsize(os.path.join(MODEL_DIR, fname)) / 1024
     print(f"  ✓ {fname:<32}  ({size:>8.1f} KB)")
 
@@ -412,7 +252,7 @@ print("=" * 68)
 y_pred_rf  = rf.predict(X_test)
 y_proba_rf = rf.predict_proba(X_test)
 confidence = y_proba_rf.max(axis=1)
-y_pred_iso = np.where(iso.decision_function(X_test) < IF_THRESHOLD, -1, 1)
+y_pred_iso = iso.predict(X_test)
 iso_scores = iso.decision_function(X_test)
 y_pred_km  = km.predict(X_test)
 
@@ -429,13 +269,6 @@ n_anom = (y_pred_iso == -1).sum()
 print(f"  ✅  IF Anomalies detected   : {n_anom:,} / {len(y_pred_iso):,} "
       f"({n_anom / len(y_pred_iso) * 100:.1f}%)")
 
-# ── IF benign-vs-attack separation (this is the key metric for a one-class IF) ─
-is_benign_test = (y_test_raw == "Benign")
-fp_rate = (y_pred_iso[is_benign_test] == -1).mean() * 100 if is_benign_test.any() else float("nan")
-detect_rate = (y_pred_iso[~is_benign_test] == -1).mean() * 100 if (~is_benign_test).any() else float("nan")
-print(f"  ✅  IF False Positive Rate  : {fp_rate:.2f}%  (benign test rows flagged as anomalous)")
-print(f"  ✅  IF Attack Detection Rate: {detect_rate:.2f}%  (attack test rows flagged as anomalous)")
-
 try:
     sil_idx = np.random.choice(len(X_test), min(5000, len(X_test)), replace=False)
     sil = silhouette_score(X_test[sil_idx], y_pred_km[sil_idx])
@@ -451,10 +284,6 @@ with open(os.path.join(REPORT_DIR, "classification_report.txt"), "w") as f:
     f.write(f"Overall Test Accuracy : {acc * 100:.2f}%\n")
     if auc:
         f.write(f"AUC-ROC (macro OvR)   : {auc:.4f}\n")
-    f.write(f"\nIsolation Forest (Benign-only trained, {X_iso_fit.shape[0]:,} fit rows, "
-            f"threshold={IF_THRESHOLD:.4f})\n")
-    f.write(f"  False Positive Rate   : {fp_rate:.2f}%\n")
-    f.write(f"  Attack Detection Rate : {detect_rate:.2f}%\n")
     f.write("\n")
     f.write(classification_report(y_test, y_pred_rf, target_names=le.classes_))
 
@@ -481,21 +310,6 @@ for attack in le.classes_:
     bar    = "█" * int(ai * 20)
     status = "✅" if ai >= 0.90 else "⚠️ " if ai >= 0.75 else "❌"
     print(f"  {status} {attack:<30} {mask.sum():>8,}  {ai * 100:>8.2f}%  {bar}")
-
-# ── STEP 6b : PER-CLASS IF ANOMALY RATE ────────────────────────────────────────
-print("\n" + "=" * 68)
-print("  STEP 6b — PER ATTACK TYPE — ISOLATION FOREST ANOMALY RATE")
-print("=" * 68)
-print(f"  {'Attack Type':<32} {'Samples':>8}  {'Anomaly Rate':>12}")
-print("  " + "─" * 58)
-
-for attack in le.classes_:
-    mask = y_test_raw == attack
-    if not mask.any():
-        continue
-    anom_rate = (y_pred_iso[mask] == -1).mean() * 100
-    expected  = "low ✅" if attack == "Benign" else ("high ✅" if anom_rate >= 50 else "low ⚠️")
-    print(f"  {attack:<32} {mask.sum():>8,}  {anom_rate:>10.2f}%   ({expected})")
 
 
 # ── STEP 7 : SAVE FULL PREDICTIONS ────────────────────────────────────────────
@@ -583,7 +397,7 @@ ax.hist(iso_scores[~is_attack], bins=80, alpha=0.65, color="#3498db",
 ax.hist(iso_scores[is_attack],  bins=80, alpha=0.65, color="#e74c3c",
         label="Attack", density=True)
 ax.axvline(0, color="black", linestyle="--", alpha=0.5, label="IF boundary (0)")
-ax.set_title("Isolation Forest — Anomaly Score Distribution (Benign-only trained)", fontsize=13)
+ax.set_title("Isolation Forest — Anomaly Score Distribution", fontsize=13)
 ax.set_xlabel("IF Decision Score (more negative = more anomalous)")
 ax.set_ylabel("Density"); ax.legend(); plt.tight_layout()
 plt.savefig(os.path.join(REPORT_DIR, "if_anomaly_dist.png"), dpi=150)
@@ -603,12 +417,11 @@ fig, ax = plt.subplots(figsize=(9, 5))
 summary = {
     "RF Accuracy (%)":            acc * 100,
     "RF OOB Score (%)":           rf.oob_score_ * 100,
-    "IF Attack Detection (%)":    detect_rate,
-    "IF False Positive (%)":      fp_rate,
+    "IF Anomaly Rate (%)":        n_anom / len(y_pred_iso) * 100,
     "AUC-ROC (×100)":             (auc * 100) if auc else 0,
     "K-Means Silhouette\n(×100)": (sil * 100) if sil else 0,
 }
-bar_colors = ["#2ecc71", "#27ae60", "#9b59b6", "#e74c3c", "#f39c12", "#3498db"]
+bar_colors = ["#2ecc71", "#27ae60", "#e67e22", "#9b59b6", "#3498db"]
 hbars = ax.barh(list(summary.keys()), list(summary.values()),
                 color=bar_colors, edgecolor="white")
 for bar, val in zip(hbars, summary.values()):
@@ -621,136 +434,18 @@ plt.savefig(os.path.join(REPORT_DIR, "model_summary.png"), dpi=150)
 plt.close(); print("  ✓ model_summary.png")
 
 
-# ── STEP 9 : MODEL ACCURACY SUMMARY  (single file — Train / Test / Overall) ───
-print("\n" + "=" * 68)
-print("  STEP 9 — MODEL ACCURACY SUMMARY  →  reports/model_accuracy_summary.txt")
-print("=" * 68)
-
-
-def clustering_purity(true_labels, cluster_ids) -> float:
-    """
-    Majority-vote purity: each cluster is assigned the majority true label
-    among its members; accuracy = fraction of rows matching their cluster's
-    majority label. Standard proxy for 'accuracy' in unsupervised clustering.
-    """
-    df = pd.DataFrame({"true": true_labels, "cluster": cluster_ids})
-    correct = 0
-    for cid in df["cluster"].unique():
-        subset = df.loc[df["cluster"] == cid, "true"]
-        if len(subset) == 0:
-            continue
-        correct += subset.value_counts().iloc[0]
-    return correct / len(df)
-
-
-def if_binary_accuracy(y_pred_iso_arr, y_true_raw_arr) -> float:
-    """
-    Isolation Forest as a binary Normal/Attack detector:
-    predicted 'attack' = anomaly flag (-1); true 'attack' = label != 'Benign'.
-    """
-    pred_attack = (y_pred_iso_arr == -1).astype(int)
-    true_attack = (y_true_raw_arr != "Benign").astype(int)
-    return (pred_attack == true_attack).mean()
-
-
-# ── Random Forest ──────────────────────────────────────────────────────────
-y_pred_rf_train = rf.predict(X_train)
-rf_train_acc = accuracy_score(y_train, y_pred_rf_train)
-rf_test_acc  = acc  # already computed in Step 5
-rf_overall_acc = accuracy_score(
-    np.concatenate([y_train, y_test]),
-    np.concatenate([y_pred_rf_train, y_pred_rf]),
-)
-
-# ── Isolation Forest (binary Normal vs Attack accuracy) ───────────────────
-y_pred_iso_train = np.where(iso.decision_function(X_train) < IF_THRESHOLD, -1, 1)
-if_train_acc = if_binary_accuracy(y_pred_iso_train, y_train_raw)
-if_test_acc  = if_binary_accuracy(y_pred_iso, y_test_raw)
-if_overall_acc = if_binary_accuracy(
-    np.concatenate([y_pred_iso_train, y_pred_iso]),
-    np.concatenate([y_train_raw, y_test_raw]),
-)
-
-# ── K-Means (majority-vote cluster purity) ─────────────────────────────────
-y_pred_km_train = km.predict(X_train)
-km_train_acc = clustering_purity(y_train_raw, y_pred_km_train)
-km_test_acc  = clustering_purity(y_test_raw, y_pred_km)
-km_overall_acc = clustering_purity(
-    np.concatenate([y_train_raw, y_test_raw]),
-    np.concatenate([y_pred_km_train, y_pred_km]),
-)
-
-summary_lines = []
-summary_lines.append("=" * 72)
-summary_lines.append("  CAAP IoMT IDS — MODEL ACCURACY SUMMARY")
-summary_lines.append("  Author : R.M.C.B. Rathnayake | IT22061270 | SLIIT Cyber Security")
-summary_lines.append(f"  Generated : {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-summary_lines.append("=" * 72)
-summary_lines.append("")
-summary_lines.append(f"  Training set : {len(X_train):,} rows   |   Test set : {len(X_test):,} rows")
-summary_lines.append(f"  Feature columns : {len(FEATURE_COLS)}   |   Classes : {list(le.classes_)}")
-summary_lines.append("")
-summary_lines.append(f"  {'Model':<22} {'Metric Type':<28} {'Train Acc':>10}  {'Test Acc':>10}  {'Overall Acc':>12}")
-summary_lines.append("  " + "-" * 88)
-summary_lines.append(
-    f"  {'Random Forest':<22} {'Classification accuracy':<28} "
-    f"{rf_train_acc*100:>9.2f}%  {rf_test_acc*100:>9.2f}%  {rf_overall_acc*100:>11.2f}%"
-)
-summary_lines.append(
-    f"  {'Isolation Forest':<22} {'Binary Normal/Attack acc.':<28} "
-    f"{if_train_acc*100:>9.2f}%  {if_test_acc*100:>9.2f}%  {if_overall_acc*100:>11.2f}%"
-)
-summary_lines.append(
-    f"  {'K-Means':<22} {'Majority-vote cluster purity':<28} "
-    f"{km_train_acc*100:>9.2f}%  {km_test_acc*100:>9.2f}%  {km_overall_acc*100:>11.2f}%"
-)
-summary_lines.append("")
-summary_lines.append("  Notes:")
-summary_lines.append("  - Random Forest: standard multi-class classification accuracy.")
-summary_lines.append("  - Isolation Forest: trained ONLY on Benign rows (one-class setup).")
-summary_lines.append("    Accuracy here = agreement between its anomaly flag and the true")
-summary_lines.append("    Benign/Attack label (i.e. treated as a binary detector).")
-summary_lines.append(f"    IF False Positive Rate (test)   : {fp_rate:.2f}%")
-summary_lines.append(f"    IF Attack Detection Rate (test) : {detect_rate:.2f}%")
-summary_lines.append("  - K-Means: unsupervised, so 'accuracy' = majority-vote cluster")
-summary_lines.append("    purity against the true attack-type labels (standard proxy")
-summary_lines.append("    metric for evaluating clustering quality against ground truth).")
-if auc:
-    summary_lines.append("")
-    summary_lines.append(f"  Random Forest AUC-ROC (macro OvR) : {auc:.4f}")
-if sil:
-    summary_lines.append(f"  K-Means Silhouette Score          : {sil:.4f}")
-summary_lines.append(f"  Random Forest OOB Score           : {rf.oob_score_*100:.2f}%")
-summary_lines.append("")
-summary_lines.append("=" * 72)
-
-summary_text = "\n".join(summary_lines)
-print("\n" + summary_text)
-
-summary_path = os.path.join(REPORT_DIR, "model_accuracy_summary.txt")
-with open(summary_path, "w", encoding="utf-8") as f:
-    f.write(summary_text + "\n")
-
-print(f"\n  ✓ Saved → {summary_path}")
-
-
 # ── FINAL SUMMARY ─────────────────────────────────────────────────────────────
 elapsed = time.time() - t_start
 print("\n" + "=" * 68)
 print(f"  ✅  ALL DONE!")
-print(f"  Classes trained on          : {list(le.classes_)}")
-print(f"  Feature columns             : {len(FEATURE_COLS)}")
-print(f"  RF Overall Accuracy         : {acc * 100:.2f}%")
+print(f"  Classes trained on  : {list(le.classes_)}")
+print(f"  Feature columns     : {len(FEATURE_COLS)}")
+print(f"  Overall Accuracy    : {acc * 100:.2f}%")
 if auc:
-    print(f"  RF AUC-ROC                  : {auc:.4f}")
-print(f"  RF OOB Score                : {rf.oob_score_ * 100:.2f}%")
-print(f"  IF fit rows (Benign)        : {X_iso_fit.shape[0]:,}")
-print(f"  IF decision threshold       : {IF_THRESHOLD:.4f}")
-print(f"  IF False Positive Rate      : {fp_rate:.2f}%")
-print(f"  IF Attack Detection Rate    : {detect_rate:.2f}%")
-print(f"  Training time                : {elapsed:.1f}s")
+    print(f"  AUC-ROC             : {auc:.4f}")
+print(f"  OOB Score           : {rf.oob_score_ * 100:.2f}%")
+print(f"  Training time       : {elapsed:.1f}s")
 print("=" * 68)
 print(f"  Models  → {MODEL_DIR}/")
 print(f"  Reports → {REPORT_DIR}/")
-print(f"  Accuracy summary → {summary_path}")
 print("=" * 68 + "\n")
