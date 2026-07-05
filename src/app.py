@@ -16,6 +16,7 @@ Test:
 """
 
 import os
+import json
 import joblib
 import numpy as np
 import pandas as pd
@@ -44,14 +45,17 @@ KMEANS_FEATURES = ["flow_bytes_s", "flow_packets_s", "flow_iat_mean", "fwd_pkt_l
 CLUSTER_LABELS = {0: "idle", 1: "active"}  # confirm actual index<->label mapping from training
 
 # Clinical Criticality (CC) lookup — rule-based, no ML (Phase 2, Day 4)
+# Clinical Criticality (CC) lookup — rule-based, no ML (Phase 2, Day 4)
+# Rescaled 1-10 (doubled from the plan's 1-5 table) so CAS ceiling reaches 10,
+# matching the documented thresholds (Immediate >= 8, Investigate >= 5).
 CC_LOOKUP = {
-    "ICU Ventilator": 5,
-    "Infusion Pump": 4,
-    "Radiology": 3,
-    "Nurse WS": 2,
-    "Admin PC": 1,
+    "ICU Ventilator": 10,
+    "Infusion Pump": 8,
+    "Radiology": 6,
+    "Nurse WS": 4,
+    "Admin PC": 2,
 }
-DEFAULT_CC = 1  # unknown device types treated as lowest criticality
+DEFAULT_CC = 2  # unknown device types treated as lowest criticality
 
 # CAS formula weights (Phase 3)
 CAS_WEIGHTS = {"TR": 0.25, "CC": 0.30, "TS": 0.25, "AE": 0.10, "TC": 0.10}
@@ -118,22 +122,22 @@ def to_feature_frame(payload: dict) -> pd.DataFrame:
 
 
 def rf_to_tr_score(confidence: float) -> float:
-    """Map Random Forest confidence (0-1) -> Threat Risk score (1-5)."""
-    return round(1 + confidence * 4, 2)
+    """Map Random Forest confidence (0-1) -> Threat Risk score (1-10)."""
+    return round(1 + confidence * 9, 2)
 
 
 def if_to_ts_score(anomaly_score: float, hour_of_day: int) -> float:
     """
-    Map Isolation Forest decision_function() output -> Time Sensitivity (1-5).
-    score < IF_THRESHOLD (loaded from if_threshold.pkl) -> anomalous -> TS = 5
+    Map Isolation Forest decision_function() output -> Time Sensitivity (1-10).
+    score < IF_THRESHOLD (loaded from if_threshold.pkl) -> anomalous -> TS = 10
     otherwise -> routine traffic -> TS driven by time-of-day
                  (off-hours = higher sensitivity, since fewer staff on duty)
     """
     if anomaly_score < IF_THRESHOLD:
-        return 5.0
+        return 10.0
     if hour_of_day < 6 or hour_of_day >= 22:  # night shift, low staffing
-        return 3.5
-    return 1.5
+        return 6.0
+    return 2.0
 
 
 def lookup_cc(device_type: str) -> float:
@@ -142,12 +146,12 @@ def lookup_cc(device_type: str) -> float:
 
 def lookup_ae(cve_known_exploited: bool) -> float:
     """Active Exploitation — rule based on CVE/CVSS lookup (stubbed input flag)."""
-    return 5.0 if cve_known_exploited else 1.0
+    return 10.0 if cve_known_exploited else 2.0
 
 
 def lookup_tc(hour_of_day: int) -> float:
     """Temporal Context — shift-based rule (night shift = higher weight)."""
-    return 4.0 if (hour_of_day < 6 or hour_of_day >= 22) else 2.0
+    return 8.0 if (hour_of_day < 6 or hour_of_day >= 22) else 4.0
 
 
 def compute_cas(tr, cc, ts, ae, tc) -> float:
@@ -194,6 +198,168 @@ def top_shap_features(scaled_row: np.ndarray, n: int = 3) -> str:
     top_idx = np.argsort(np.abs(class_shap))[::-1][:n]
     parts = [f"{FEATURE_COLUMNS[i]} ({class_shap[i]:+.2f})" for i in top_idx]
     return "Top contributing features: " + ", ".join(parts)
+
+
+# --------------------------------------------------------------------------
+# Simple built-in test dashboard (GET /)
+# --------------------------------------------------------------------------
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CAAP AI Server — Test Console</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #171d2b; --border: #2a3244; --text: #e6e9ef;
+    --muted: #8b93a7; --accent: #4f8cff; --green: #2ecc71; --orange: #f39c12; --red: #e74c3c;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text); font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    margin: 0; padding: 32px; line-height: 1.5;
+  }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 28px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1100px; }
+  @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 9px 16px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { opacity: 0.9; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  textarea {
+    width: 100%; height: 340px; background: #0c111c; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px;
+    font-family: "SF Mono", Consolas, monospace; font-size: 12px; resize: vertical;
+  }
+  pre {
+    background: #0c111c; border: 1px solid var(--border); border-radius: 6px;
+    padding: 12px; font-size: 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+    min-height: 60px; margin-top: 10px;
+  }
+  .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); display: inline-block; }
+  .status-dot.ok { background: var(--green); }
+  .status-dot.fail { background: var(--red); }
+  .row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .badge {
+    display: inline-block; padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 700;
+  }
+  .badge.Immediate { background: var(--red); color: white; }
+  .badge.Investigate { background: var(--orange); color: white; }
+  .badge.Monitor { background: var(--green); color: white; }
+  .muted { color: var(--muted); font-size: 12px; }
+</style>
+</head>
+<body>
+
+<h1>CAAP AI Server — Test Console</h1>
+<div class="subtitle">Quick manual checks for /health and /predict — no curl/Postman needed.</div>
+
+<div class="grid">
+
+  <div class="card">
+    <h2><span class="status-dot" id="health-dot"></span> Health Check</h2>
+    <p class="muted">Confirms the server is running and models are loaded.</p>
+    <button onclick="checkHealth()">Test /health</button>
+    <pre id="health-result">Not checked yet.</pre>
+  </div>
+
+  <div class="card">
+    <h2><span class="status-dot" id="predict-dot"></span> Predict</h2>
+    <p class="muted">Edit the JSON below (or leave the sample as-is), then send it to /predict.</p>
+    <textarea id="predict-input">SAMPLE_JSON_PLACEHOLDER</textarea>
+    <div class="row" style="margin-top:10px;">
+      <button onclick="runPredict()">Send to /predict</button>
+      <span id="predict-summary"></span>
+    </div>
+    <pre id="predict-result">No request sent yet.</pre>
+  </div>
+
+</div>
+
+<script>
+async function checkHealth() {
+  const dot = document.getElementById('health-dot');
+  const out = document.getElementById('health-result');
+  out.textContent = 'Checking...';
+  try {
+    const res = await fetch('/health');
+    const data = await res.json();
+    dot.className = 'status-dot ' + (res.ok ? 'ok' : 'fail');
+    out.textContent = JSON.stringify(data, null, 2);
+  } catch (err) {
+    dot.className = 'status-dot fail';
+    out.textContent = 'Request failed: ' + err;
+  }
+}
+
+async function runPredict() {
+  const dot = document.getElementById('predict-dot');
+  const out = document.getElementById('predict-result');
+  const summary = document.getElementById('predict-summary');
+  const input = document.getElementById('predict-input').value;
+  summary.innerHTML = '';
+  out.textContent = 'Sending...';
+
+  let payload;
+  try {
+    payload = JSON.parse(input);
+  } catch (err) {
+    dot.className = 'status-dot fail';
+    out.textContent = 'Invalid JSON in the box above: ' + err;
+    return;
+  }
+
+  try {
+    const res = await fetch('/predict', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json();
+    dot.className = 'status-dot ' + (res.ok ? 'ok' : 'fail');
+    out.textContent = JSON.stringify(data, null, 2);
+
+    if (data.action) {
+      summary.innerHTML = `<span class="badge ${data.action}">${data.action}</span>` +
+        ` &nbsp; label: <b>${data.label}</b> &nbsp; CAS: <b>${data.CAS}</b> &nbsp; confidence: ${data.confidence}`;
+    }
+  } catch (err) {
+    dot.className = 'status-dot fail';
+    out.textContent = 'Request failed: ' + err;
+  }
+}
+
+// Run a health check automatically on page load
+checkHealth();
+</script>
+
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET"])
+def index():
+    """Simple built-in test dashboard — buttons for /health and /predict, no curl needed."""
+    sample_json = json.dumps(
+        {**{col: 0.0 for col in FEATURE_COLUMNS}, **{
+            "device_type": "ICU Ventilator",
+            "department": "ICU",
+            "hour_of_day": 3,
+            "cve_known_exploited": True,
+        }},
+        indent=2,
+    )
+    return INDEX_HTML.replace("SAMPLE_JSON_PLACEHOLDER", sample_json)
 
 
 # --------------------------------------------------------------------------
